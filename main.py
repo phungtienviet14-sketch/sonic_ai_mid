@@ -72,21 +72,47 @@ DSN = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:5432/{DB_NAME}"
 # ==========================================
 def sync_stt(audio_bytes: bytes) -> str:
     """Hàm đồng bộ chạy ngầm: Dịch Byte Audio (chuẩn WAV) thành Text"""
+    if not audio_bytes:
+        return ""
+
     recognizer = sr.Recognizer()
     try:
-        # Giả định ESP32 gửi lên mảng byte của file định dạng WAV
         with sr.AudioFile(io.BytesIO(audio_bytes)) as source:
             audio = recognizer.record(source)
-        # Sử dụng Google Web Speech API miễn phí
         text = recognizer.recognize_google(audio, language="vi-VN")
         return text
     except sr.UnknownValueError:
         return "Chú Robot không nghe rõ con nói gì."
     except Exception as e:
-        print(f"⚠️ Lỗi STT: {e}")
-        return ""
+        print(f"⚠️ Lỗi định dạng file Audio (STT): {e}")
+        return "Chú Robot không nghe rõ con nói gì."
 
 
+async def audio_to_text(audio_bytes: bytes) -> str:
+    """Đưa hàm STT vào thread pool để không block server FastAPI"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, sync_stt, audio_bytes)
+
+
+async def text_to_audio_bytes(text: str) -> bytes:
+    """Dùng edge-tts tạo luồng Audio MP3 từ Text với cơ chế an toàn"""
+    # Xóa khoảng trắng thừa và kiểm tra chuỗi rỗng
+    clean_text = text.strip() if text else ""
+
+    if not clean_text:
+        print("⚠️ Cảnh báo: AI trả về văn bản trống, bỏ qua tạo TTS.")
+        return b""
+
+    try:
+        communicate = edge_tts.Communicate(clean_text, "vi-VN-HoaiMyNeural")
+        audio_data = bytearray()
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_data.extend(chunk["data"])
+        return bytes(audio_data)
+    except Exception as e:
+        print(f"⚠️ Lỗi API TTS: {e}")
+        return b""
 async def audio_to_text(audio_bytes: bytes) -> str:
     """Đưa hàm STT vào thread pool để không block server FastAPI"""
     loop = asyncio.get_event_loop()
@@ -326,17 +352,26 @@ async def robot_endpoint(websocket: WebSocket, user_id: str):
             await save_chat_history(session_id, "robot", ai_text_response)
 
             # BƯỚC MỚI: Trả về dữ liệu cho phần cứng
+
+            # Đảm bảo có câu trả lời mặc định nếu AI lỗi không trả về text
+            if not ai_text_response or not ai_text_response.strip():
+                ai_text_response = "Xin lỗi con, chú đang suy nghĩ một chút nhé."
+
             # 1. Gửi chuỗi Text (Để ESP32 có thể hiển thị lên màn hình LCD nếu có)
             await websocket.send_text(json.dumps({
                 "type": "text_response",
                 "message": ai_text_response
-            }))
+            }, ensure_ascii=False))
 
             # 2. Dịch câu trả lời sang Audio và gửi luồng Nhị phân (Binary) xuống Robot
             print("🔊 Đang tạo luồng âm thanh (TTS)...")
             response_audio_bytes = await text_to_audio_bytes(ai_text_response)
-            await websocket.send_bytes(response_audio_bytes)
-            print("✅ Đã gửi Audio xuống loa Robot.")
+
+            if response_audio_bytes:
+                await websocket.send_bytes(response_audio_bytes)
+                print("✅ Đã gửi Audio xuống loa Robot.")
+            else:
+                print("⚠️ Bỏ qua bước gửi Audio do lỗi TTS hoặc không có dữ liệu âm thanh.")
 
     except WebSocketDisconnect:
         print(f"❌ Ngắt kết nối.")
