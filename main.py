@@ -4,21 +4,24 @@ import json
 import os
 import uuid
 import httpx
+import io
+import asyncio
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-# 1. Thêm 2 dòng này để nạp biến môi trường từ file .env
 from dotenv import load_dotenv
+
 load_dotenv()
 
-# Thư viện Google GenAI SDK mới
 from google import genai
 from google.genai import types
 
-# 2. Khởi tạo client (Lúc này nó sẽ tự tìm thấy GEMINI_API_KEY)
+# --- THƯ VIỆN AUDIO ---
+import edge_tts
+import speech_recognition as sr
+
 gemini_client = genai.Client()
 
-# Định nghĩa Tool/Function Calling cho LLM biết hệ thống có gì
 calculator_tool = types.Tool(
     function_declarations=[
         types.FunctionDeclaration(
@@ -38,149 +41,177 @@ calculator_tool = types.Tool(
     ]
 )
 
+db_pool = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_pool
     try:
         db_pool = await asyncpg.create_pool(DSN)
-        print("✅ Đã kết nối thành công tới PostgreSQL")
+        print("✅ Đã kết nối DB")
     except Exception as e:
-        print(f"⚠️ Không thể kết nối PostgreSQL: {e}")
+        print(f"⚠️ Lỗi DB: {e}")
         db_pool = None
-    try:
-        yield
-    finally:
-        if db_pool:
-            await db_pool.close()
-            print("✅ Đã đóng connection pool PostgreSQL")
+    yield
+    if db_pool:
+        await db_pool.close()
 
 
 app = FastAPI(title="AI Backend - Robot Orchestrator", lifespan=lifespan)
 
-# Cấu hình Database
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "chaidim")
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_NAME = os.getenv("DB_NAME", "postgres")
 DSN = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:5432/{DB_NAME}"
-db_pool = None
 
 
+# ==========================================
+# CÁC HÀM XỬ LÝ AUDIO BẤT ĐỒNG BỘ
+# ==========================================
+def sync_stt(audio_bytes: bytes) -> str:
+    """Hàm đồng bộ chạy ngầm: Dịch Byte Audio (chuẩn WAV) thành Text"""
+    recognizer = sr.Recognizer()
+    try:
+        # Giả định ESP32 gửi lên mảng byte của file định dạng WAV
+        with sr.AudioFile(io.BytesIO(audio_bytes)) as source:
+            audio = recognizer.record(source)
+        # Sử dụng Google Web Speech API miễn phí
+        text = recognizer.recognize_google(audio, language="vi-VN")
+        return text
+    except sr.UnknownValueError:
+        return "Chú Robot không nghe rõ con nói gì."
+    except Exception as e:
+        print(f"⚠️ Lỗi STT: {e}")
+        return ""
+
+
+async def audio_to_text(audio_bytes: bytes) -> str:
+    """Đưa hàm STT vào thread pool để không block server FastAPI"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, sync_stt, audio_bytes)
+
+
+async def text_to_audio_bytes(text: str) -> bytes:
+    """Dùng edge-tts tạo luồng Audio MP3 từ Text"""
+    # vi-VN-HoaiMyNeural là giọng nữ AI cực kỳ truyền cảm, hợp với trẻ em
+    communicate = edge_tts.Communicate(text, "vi-VN-HoaiMyNeural")
+    audio_data = bytearray()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio_data.extend(chunk["data"])
+    return bytes(audio_data)
+
+
+# ==========================================
+# CÁC HÀM DATABASE
+# ==========================================
 async def create_chat_session(user_id: str) -> str:
-    if not db_pool:
-        fake_id = uuid.uuid4().hex
-        return fake_id
+    if not db_pool: return uuid.uuid4().hex
     async with db_pool.acquire() as connection:
-        session_id = await connection.fetchval(
-            "INSERT INTO chat_sessions (user_id) VALUES ($1::uuid) RETURNING session_id", user_id
-        )
-        return str(session_id)
+        return str(
+            await connection.fetchval("INSERT INTO chat_sessions (user_id) VALUES ($1::uuid) RETURNING session_id",
+                                      user_id))
 
 
 async def save_chat_history(session_id: str, sender: str, content: str):
     if not db_pool: return
     async with db_pool.acquire() as connection:
-        await connection.execute(
-            "INSERT INTO chat_history (session_id, sender, content) VALUES ($1, $2, $3)",
-            session_id, sender, content
-        )
+        await connection.execute("INSERT INTO chat_history (session_id, sender, content) VALUES ($1, $2, $3)",
+                                 session_id, sender, content)
 
 
-@app.get("/")
-async def health_check():
-    return {"status": "AI Backend is running with Gemini 2.5 Flash",
-            "database": "connected" if db_pool else "disconnected"}
-
-
+# ==========================================
+# WEBSOCKET ENDPOINT CHÍNH
+# ==========================================
 @app.websocket("/ws/robot/{user_id}")
 async def robot_endpoint(websocket: WebSocket, user_id: str):
     await websocket.accept()
     print(f"🔌 Robot của bé (User ID: {user_id}) đã kết nối.")
-    session_id = None
+    session_id = await create_chat_session(user_id)
+
+    chat = gemini_client.aio.chats.create(
+        model="gemini-2.5-flash",
+        config=types.GenerateContentConfig(
+            temperature=0.7,
+            system_instruction="Bạn là chú Robot thông minh, vui vẻ và thân thiện đang nói chuyện với trẻ em. Khi trẻ em hỏi bài tập toán, bắt buộc phải dùng công cụ để tính. Hãy trả lời ngắn gọn, xưng là 'Chú Robot' và gọi bé là 'con'.",
+            tools=[calculator_tool]
+        )
+    )
 
     try:
-        session_id = await create_chat_session(user_id)
-
-        # Khởi tạo một phiên Chat không đồng bộ (aio) với Gemini cho riêng bé này
-        # Hệ thống cung cấp System Prompt và gài sẵn calculator_tool
-        chat = gemini_client.aio.chats.create(
-            model="gemini-2.5-flash",
-            config=types.GenerateContentConfig(
-                temperature=0.7,
-                system_instruction="Bạn là chú Robot thông minh, vui vẻ và thân thiện đang nói chuyện với trẻ em. Khi trẻ em hỏi bài tập toán, bắt buộc phải dùng công cụ để tính, không tự nhẩm. Hãy trả lời ngắn gọn, xưng là 'Chú Robot' và gọi bé là 'con'.",
-                tools=[calculator_tool]
-            )
-        )
-
         while True:
-            payload = await websocket.receive_text()
-            print(f"🎤 Thu nhận từ Robot: {payload}")
+            # Nhận dữ liệu dưới dạng Dictionary (Có thể là Text hoặc Bytes)
+            message = await websocket.receive()
+            payload = ""
+
+            # Phân loại luồng dữ liệu ESP32 gửi lên
+            if "text" in message:
+                payload = message["text"]
+                print(f"⌨️ Thu nhận Text: {payload}")
+            elif "bytes" in message:
+                audio_bytes = message["bytes"]
+                print(f"🎤 Thu nhận {len(audio_bytes)} bytes Audio. Đang dịch STT...")
+                payload = await audio_to_text(audio_bytes)
+                print(f"📝 Kết quả STT: {payload}")
+
+            if not payload or payload == "Chú Robot không nghe rõ con nói gì.":
+                await websocket.send_text(
+                    json.dumps({"type": "text_response", "message": "Con nói to lên một chút nhé!"}))
+                continue
+
             await save_chat_history(session_id, "user", payload)
 
-            print("🧠 Đang gửi lên Đám mây AI (Gemini)...")
-            # Giai đoạn 1: Gửi nguyên văn câu hỏi lên LLM
+            print("🧠 Đang xử lý LLM...")
             response = await chat.send_message(payload)
 
-            # Giai đoạn 2: LLM phân tích và quyết định có gọi Tool không
+            # Xử lý Tool Calling (MCP Gateway)
+            ai_text_response = response.text
             if response.function_calls:
                 for tool_call in response.function_calls:
                     if tool_call.name == "calculator":
-                        print(f"⚙️ [Gemini] Yêu cầu gọi công cụ Tính toán với tham số: {tool_call.args}")
-
-                        tool_payload = {
-                            "tool": "calculator",
-                            "action": tool_call.args.get("action"),
-                            "a": tool_call.args.get("a"),
-                            "b": tool_call.args.get("b")
-                        }
-
-                        # Định tuyến qua Gateway (Bắn HTTP POST)
+                        print("⚙️ Đang gọi Gateway Tính toán...")
+                        tool_payload = {"tool": "calculator", "action": tool_call.args.get("action"),
+                                        "a": tool_call.args.get("a"), "b": tool_call.args.get("b")}
                         async with httpx.AsyncClient() as http_client:
                             try:
-                                gw_response = await http_client.post("http://127.0.0.1:8001/mcp/math",
-                                                                     json=tool_payload)
-                                result_data = gw_response.json()
-                                calc_result = result_data.get("result", "Lỗi")
-                                print(f"✅ [Gateway] Trả về kết quả: {calc_result}")
-                            except Exception as e:
-                                print(f"⚠️ [Gateway] Lỗi kết nối: {e}")
-                                calc_result = "Lỗi đường truyền đến máy tính"
+                                gw_res = await http_client.post("http://127.0.0.1:8001/mcp/math", json=tool_payload)
+                                calc_result = gw_res.json().get("result", "Lỗi")
+                            except Exception:
+                                calc_result = "Lỗi mạng"
 
-                        # Giai đoạn 3: Nạp kết quả thô ngược lại cho Gemini
-                        tool_response_part = types.Part.from_function_response(
-                            name="calculator",
-                            response={"result": calc_result}
-                        )
-
-                        print("🧠 Đang gửi kết quả tính toán về LLM để lắp ráp câu văn...")
+                        tool_response_part = types.Part.from_function_response(name="calculator",
+                                                                               response={"result": calc_result})
                         final_response = await chat.send_message(tool_response_part)
                         ai_text_response = final_response.text
-            else:
-                # Trẻ hỏi các câu giao tiếp bình thường (không cần tính toán)
-                ai_text_response = response.text
 
-            print(f"🤖 [Robot] Phản hồi: {ai_text_response}")
+            print(f"🤖 Trả lời Text: {ai_text_response}")
             await save_chat_history(session_id, "robot", ai_text_response)
 
-            # Đẩy về phần cứng biên
+            # BƯỚC MỚI: Trả về dữ liệu cho phần cứng
+            # 1. Gửi chuỗi Text (Để ESP32 có thể hiển thị lên màn hình LCD nếu có)
             await websocket.send_text(json.dumps({
                 "type": "text_response",
                 "message": ai_text_response
             }))
 
+            # 2. Dịch câu trả lời sang Audio và gửi luồng Nhị phân (Binary) xuống Robot
+            print("🔊 Đang tạo luồng âm thanh (TTS)...")
+            response_audio_bytes = await text_to_audio_bytes(ai_text_response)
+            await websocket.send_bytes(response_audio_bytes)
+            print("✅ Đã gửi Audio xuống loa Robot.")
+
     except WebSocketDisconnect:
-        print(f"❌ Robot của bé (User ID: {user_id}) đã ngắt kết nối.")
+        print(f"❌ Ngắt kết nối.")
         if session_id and db_pool:
             async with db_pool.acquire() as connection:
                 await connection.execute("UPDATE chat_sessions SET is_active = FALSE WHERE session_id = $1", session_id)
     except Exception as e:
-        print(f"⚠️ Lỗi kết nối mạng: {str(e)}")
+        print(f"⚠️ Lỗi: {e}")
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
