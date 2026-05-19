@@ -6,6 +6,7 @@ import uuid
 import httpx
 import io
 import asyncio
+import re
 from datetime import datetime
 from contextlib import asynccontextmanager
 
@@ -113,21 +114,7 @@ async def text_to_audio_bytes(text: str) -> bytes:
     except Exception as e:
         print(f"⚠️ Lỗi API TTS: {e}")
         return b""
-async def audio_to_text(audio_bytes: bytes) -> str:
-    """Đưa hàm STT vào thread pool để không block server FastAPI"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, sync_stt, audio_bytes)
 
-
-async def text_to_audio_bytes(text: str) -> bytes:
-    """Dùng edge-tts tạo luồng Audio MP3 từ Text"""
-    # vi-VN-HoaiMyNeural là giọng nữ AI cực kỳ truyền cảm, hợp với trẻ em
-    communicate = edge_tts.Communicate(text, "vi-VN-HoaiMyNeural")
-    audio_data = bytearray()
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            audio_data.extend(chunk["data"])
-    return bytes(audio_data)
 
 
 async def get_user_profile(user_id: str) -> dict:
@@ -235,6 +222,65 @@ async def save_chat_history(session_id: str, sender: str, content: str):
                                  session_id, sender, content)
 
 
+async def safe_send_message(chat, payload, websocket: WebSocket, max_retries=2):
+    """
+    Hàm bọc gọi Gemini API (Phiên bản DEBUG TOÀN DIỆN)
+    """
+    print(f"\n🚀 [DEBUG] Đang gửi Request lên Gemini API...")
+
+    for attempt in range(max_retries):
+        try:
+            # Gửi tin nhắn
+            response = await chat.send_message(payload)
+            print(f"✅ [DEBUG] Nhận Response thành công từ Gemini.")
+            return response
+
+        except Exception as e:
+            error_msg = str(e)
+
+            # --- IN LOG CHI TIẾT ĐỂ DEBUG ---
+            print("\n" + "=" * 60)
+            print("🚨 BẮT ĐẦU DEBUG LỖI API (GEMINI) 🚨")
+            print(f"Lần thử: {attempt + 1}/{max_retries}")
+            print(f"Loại lỗi (Exception Class): {type(e).__name__}")
+            print(f"Thông báo lỗi thô (Raw Message):\n{error_msg}")
+            print("-" * 60)
+            print("Traceback chi tiết:")
+            traceback.print_exc()
+            print("=" * 60 + "\n")
+            # --------------------------------
+
+            # Xử lý Rate Limit
+            if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+                wait_time = 15.0  # Mặc định đợi 15s
+
+                match = re.search(r'retry in ([\d\.]+)s', error_msg)
+                if match:
+                    wait_time = float(match.group(1)) + 1.0
+
+                print(f"⏳ [Rate Limit] Đụng trần API. Hệ thống sẽ ngủ đông {wait_time:.1f} giây...")
+
+                if attempt == 0:
+                    wait_text = "Câu hỏi này khó quá, chú Robot đang suy nghĩ, con đợi chú một tẹo nhé!"
+                    try:
+                        await websocket.send_text(
+                            json.dumps({"type": "text_response", "message": wait_text}, ensure_ascii=False)
+                        )
+                        # Tạm thời tắt TTS thông báo chờ để xem log cho rõ
+                        # wait_audio = await text_to_audio_bytes(wait_text)
+                        # if wait_audio:
+                        #     await websocket.send_bytes(wait_audio)
+                    except Exception as ws_err:
+                        print(f"⚠️ [DEBUG] Không thể gửi thông báo chờ qua WS: {ws_err}")
+
+                await asyncio.sleep(wait_time)
+
+                if attempt == max_retries - 1:
+                    print("❌ [DEBUG] Đã hết số lần thử lại. Hủy Request.")
+                    raise Exception("Hệ thống AI đang quá tải, không thể thử lại.")
+            else:
+                print("❌ [DEBUG] Lỗi này không phải Rate Limit. Hủy Request.")
+                raise e
 # ==========================================
 # WEBSOCKET ENDPOINT CHÍNH
 # ==========================================
@@ -303,7 +349,13 @@ async def robot_endpoint(websocket: WebSocket, user_id: str):
             await save_chat_history(session_id, "user", payload)
 
             print("🧠 Đang xử lý LLM...")
-            response = await chat.send_message(payload)
+            try:
+                response = await safe_send_message(chat, payload, websocket)
+            except Exception as e:
+                await websocket.send_text(
+                    json.dumps({"type": "text_response", "message": "Hệ thống AI đang quá tải, con hỏi lại sau nhé!"},
+                               ensure_ascii=False))
+                continue
 
             # Xử lý Tool Calling (MCP Gateway hoặc Cập nhật DB nội bộ)
             ai_text_response = response.text
@@ -326,7 +378,8 @@ async def robot_endpoint(websocket: WebSocket, user_id: str):
 
                         tool_response_part = types.Part.from_function_response(name="calculator",
                                                                                response={"result": calc_result})
-                        final_response = await chat.send_message(tool_response_part)
+                        # Dùng hàm an toàn để gửi lại kết quả của Tool
+                        final_response = await safe_send_message(chat, tool_response_part, websocket)
                         ai_text_response = final_response.text
 
                     # ---------------------------------------------
@@ -345,7 +398,8 @@ async def robot_endpoint(websocket: WebSocket, user_id: str):
                             name="update_preferences",
                             response={"status": db_status}
                         )
-                        final_response = await chat.send_message(tool_response_part)
+                        # Dùng hàm an toàn để gửi lại kết quả của Tool
+                        final_response = await safe_send_message(chat, tool_response_part, websocket)
                         ai_text_response = final_response.text
 
             print(f"🤖 Trả lời Text: {ai_text_response}")
