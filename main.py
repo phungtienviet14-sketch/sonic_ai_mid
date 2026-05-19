@@ -2,6 +2,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import asyncpg
 import json
 import os
+import httpx
 from datetime import datetime
 from contextlib import asynccontextmanager
 import uuid
@@ -92,35 +93,48 @@ async def robot_endpoint(websocket: WebSocket, user_id: str):
         print(f"📝 Đã tạo Session ID mới: {session_id}")
 
         while True:
-            # Giai đoạn 1: Thu nhận và Hiểu ý định từ phần cứng biên
-            # Lắng nghe dữ liệu từ Robot (Trong thực tế có thể là Bytes Audio cần qua STT)
-            # Ở đây dùng Text để mô phỏng dữ liệu sau khi đã chuyển đổi STT
             payload = await websocket.receive_text()
             print(f"🎤 Thu nhận từ Robot: {payload}")
-
-            # Lưu câu hỏi của trẻ vào Database
             await save_chat_history(session_id, "user", payload)
 
             # ---------------------------------------------------------
-            # [TODO: Giai đoạn 1 & 2] - Sẽ thực hiện ở các bước tiếp theo
-            # 1. Gọi API lên Đám mây AI (OpenAI/Anthropic) kèm context.
-            # 2. Nếu AI trả về Tool Calling -> Gọi sang API Gateway -> MCP Server (Ví dụ: Tính toán).
-            # 3. Lấy kết quả thô từ MCP, gửi lại lên AI để sinh câu nói tự nhiên.
+            # MÔ PHỎNG ĐÁM MÂY AI (LLM CLOUD) QUYẾT ĐỊNH GỌI TOOL
             # ---------------------------------------------------------
+            # Nếu trẻ hỏi một câu liên quan đến "123 cộng 456"
+            if "cộng" in payload.lower() or "bằng mấy" in payload.lower():
+                print("🧠 [LLM Mock] Phát hiện ý định tính toán, chuẩn bị gọi Tool...")
 
-            # Giả lập luồng xử lý tạm thời (Mockup AI Response)
-            ai_text_response = f"Chú Robot đã nghe thấy con nói: '{payload}'. Đợi chú nối cáp sang Đám mây AI nhé!"
+                # LLM trả về lệnh gọi công cụ chuẩn hóa
+                tool_call_payload = {
+                    "tool": "calculator",
+                    "action": "add",
+                    "a": 123,
+                    "b": 456
+                }
 
-            # Lưu câu trả lời của Robot vào Database
+                # Định tuyến qua Gateway (Đẩy HTTP POST sang Port 8001)
+                async with httpx.AsyncClient() as client:
+                    try:
+                        gw_response = await client.post(
+                            "http://127.0.0.1:8001/mcp/math",
+                            json=tool_call_payload
+                        )
+                        result_data = gw_response.json()
+                        calc_result = result_data.get("result", "Lỗi")
+
+                        # Tổng hợp câu trả lời (LLM lắp ráp dữ liệu thô thành câu tự nhiên)
+                        ai_text_response = f"Kết quả là {calc_result} con nhé!"
+                    except Exception as e:
+                        ai_text_response = "Đường truyền tới máy tính đang bị lỗi con ạ."
+            else:
+                ai_text_response = f"Chú Robot đã nghe thấy con nói: '{payload}'."
+
+            # Lưu và trả kết quả về Robot
             await save_chat_history(session_id, "robot", ai_text_response)
-
-            # Giai đoạn 3: Phản hồi về Robot
-            # Trả chuỗi ký tự (hoặc luồng Audio nhị phân nén sau khi qua TTS) về thiết bị biên
             await websocket.send_text(json.dumps({
                 "type": "text_response",
                 "message": ai_text_response
             }))
-
     except WebSocketDisconnect:
         print(f"❌ Robot của bé (User ID: {user_id}) đã ngắt kết nối.")
         # Cập nhật trạng thái session nếu cần thiết
