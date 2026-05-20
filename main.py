@@ -179,23 +179,34 @@ async def audio_to_text(audio_bytes: bytes) -> str:
     return await loop.run_in_executor(None, sync_stt, audio_bytes)
 
 
-async def text_to_audio_bytes(text: str) -> bytes:
+async def text_to_audio_bytes(text: str, max_retries=2) -> bytes:
     clean_text = text.strip() if text else ""
     if not clean_text: return b""
 
-    # --- Làm sạch văn bản cho loa dễ đọc ---
+    # Làm sạch văn bản cho loa dễ đọc
     clean_text = clean_text.replace("°C", " độ C").replace("°", " độ")
 
-    try:
-        communicate = edge_tts.Communicate(clean_text, "vi-VN-HoaiMyNeural")
-        audio_data = bytearray()
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                audio_data.extend(chunk["data"])
-        return bytes(audio_data)
-    except Exception as e:
-        logger.error(f"❌ [AUDIO] Lỗi gọi API TTS: {e}")
-        return b""
+    for attempt in range(max_retries):
+        try:
+            communicate = edge_tts.Communicate(clean_text, "vi-VN-HoaiMyNeural")
+            audio_data = bytearray()
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio_data.extend(chunk["data"])
+
+            # Nếu có dữ liệu thì trả về ngay lập tức
+            if audio_data:
+                return bytes(audio_data)
+
+        except Exception as e:
+            logger.warning(f"⚠️ [AUDIO] Lỗi TTS lần {attempt + 1}/{max_retries}: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1)  # Nghỉ 1 giây rồi gọi lại Microsoft
+            else:
+                logger.error(f"❌ [AUDIO] Đã hết số lần thử lại TTS.")
+                return b""
+
+    return b""
 
 
 async def get_user_profile(user_id: str) -> dict:
@@ -304,7 +315,9 @@ async def robot_endpoint(websocket: WebSocket, user_id: str):
     if dynamic_functions:
         all_gemini_tools.append(types.Tool(function_declarations=dynamic_functions))
 
-    base_prompt = "Bạn là chú Robot thông minh, vui vẻ và thân thiện đang nói chuyện với trẻ em. Hãy trả lời ngắn gọn, xưng là 'Chú Robot'."
+    base_prompt = "Bạn là chú Robot thông minh, vui vẻ và thân thiện đang nói chuyện với trẻ em. Hãy trả lời ngắn gọn, xưng là 'Chú Robot'. " \
+              "Nếu trẻ hỏi một thông tin mà bạn không biết hoặc công cụ không thể tìm ra, tuyệt đối không được nói dối hoặc bịaa chuyện. " \
+              "Hãy xin lỗi khéo léo, thừa nhận mình chưa biết và lái bé sang một chủ đề khác vui hơn."
     if user_profile:
         name = user_profile.get("full_name", "bé")
         age = user_profile.get("age", "không rõ")
