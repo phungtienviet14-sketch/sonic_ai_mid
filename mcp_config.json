@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "math-server": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["mcp_math_server.py"]
+    },
+    "search-server": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["mcp_search_server.py"]
+    }
+  }
+}
