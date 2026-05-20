@@ -4,12 +4,12 @@ import logging
 import requests
 from bs4 import BeautifulSoup
 from fastmcp import FastMCP
-from googlesearch import search
+from duckduckgo_search import DDGS  # <-- Đổi sang dùng DuckDuckGo
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-7s | %(message)s',
+                    datefmt="%Y-%m-%d %H:%M:%S")
 logger = logging.getLogger('SearchServer')
 
-# Fix hiển thị tiếng Việt trên Terminal Windows
 if sys.platform == 'win32':
     sys.stderr.reconfigure(encoding='utf-8')
     sys.stdout.reconfigure(encoding='utf-8')
@@ -20,51 +20,52 @@ mcp = FastMCP("SearchServer")
 def scrape_webpage(url: str, max_chars: int = 2500) -> str:
     """Truy cập URL và cào văn bản. Cắt bớt nếu quá dài để tiết kiệm Token LLM."""
     try:
-        # Giả lập trình duyệt để tránh bị chặn 403 Forbidden
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         response = requests.get(url, headers=headers, timeout=5)
         response.raise_for_status()
 
-        # Chỉ trích xuất text từ các thẻ <p> (paragraph) để loại bỏ rác HTML
         soup = BeautifulSoup(response.text, 'html.parser')
         paragraphs = soup.find_all('p')
         text_content = "\n".join([p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True)])
 
-        # Cắt chuỗi để tối ưu Token (2500 ký tự ~ khoảng 500-600 tokens)
         if len(text_content) > max_chars:
             text_content = text_content[:max_chars] + "\n...[Nội dung đã cắt bớt]..."
 
         return text_content
     except Exception as e:
-        logger.warning(f"Không thể đọc nội dung từ {url}: {e}")
+        logger.exception(f"⚠️ [MCP Search] Lỗi cào dữ liệu từ {url}:")
         return ""
 
 
 @mcp.tool()
 def google_search(query: str) -> dict:
     """
-    Sử dụng công cụ này để tìm kiếm thông tin sự kiện thực tế, kiến thức trên internet.
+    Sử dụng công cụ này để tìm kiếm thông tin sự kiện thực tế, thời tiết, kiến thức trên internet.
     """
-    logger.info(f"🔍 [MCP Search] Đang tìm kiếm: {query}")
+    logger.info(f"🔍 [MCP Search] Đang tìm kiếm qua mạng: {query}")
 
     try:
-        # 1. Tìm Top 1 kết quả tốt nhất
-        search_results = list(search(query, num_results=1, lang="vi", advanced=True))
+        # Sử dụng thư viện DuckDuckGo thay vì Google
+        with DDGS() as ddgs:
+            # Lấy Top 1 kết quả
+            results = list(ddgs.text(query, max_results=1))
 
-        if not search_results:
+        if not results:
             return {"success": False, "error": "Không tìm thấy thông tin trên mạng."}
 
-        top_result = search_results[0]
-        url = top_result.url
-        title = top_result.title
+        top_result = results[0]
+        url = top_result.get("href")
+        title = top_result.get("title")
+        description = top_result.get("body")
+
         logger.info(f"🔗 [MCP Search] Đang cào dữ liệu từ URL: {url}")
 
-        # 2. Truy cập thẳng URL để đọc nội dung
+        # Truy cập vào web để đọc tin chi tiết
         full_text = scrape_webpage(url, max_chars=2500)
 
-        # Nếu cào thất bại (do web chặn bot), fallback về đoạn tóm tắt ngắn của Google
+        # Nếu bị web chặn (Forbidden), dùng tạm đoạn mô tả ngắn gọn
         if not full_text:
-            full_text = top_result.description
+            full_text = description
 
         result_data = {
             "title": title,
@@ -72,11 +73,11 @@ def google_search(query: str) -> dict:
             "content": full_text
         }
 
-        logger.info(f"✅ [MCP Search] Gửi về LLM {len(full_text)} ký tự.")
+        logger.info(f"✅ [MCP Search] Đã lấy thành công {len(full_text)} ký tự.")
         return {"success": True, "data": result_data}
 
     except Exception as e:
-        logger.error(f"⚠️ [MCP Search] Lỗi tìm kiếm: {e}")
+        logger.exception("❌ [MCP Search] Lỗi nghiêm trọng khi thực hiện tìm kiếm:")
         return {"success": False, "error": str(e)}
 
 
