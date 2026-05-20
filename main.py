@@ -7,9 +7,7 @@ import uuid
 import io
 import asyncio
 import re
-import traceback
 import logging
-from datetime import datetime
 from contextlib import asynccontextmanager, AsyncExitStack
 
 from dotenv import load_dotenv
