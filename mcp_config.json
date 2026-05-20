@@ -9,6 +9,11 @@
       "type": "stdio",
       "command": "python",
       "args": ["mcp_search_server.py"]
+    },
+    "weather-server": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["mcp_weather_server.py"]
     }
   }
 }

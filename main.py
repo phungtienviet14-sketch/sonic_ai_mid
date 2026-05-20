@@ -7,9 +7,7 @@ import uuid
 import io
 import asyncio
 import re
-import traceback
 import logging
-from datetime import datetime
 from contextlib import asynccontextmanager, AsyncExitStack
 
 from dotenv import load_dotenv
@@ -184,6 +182,10 @@ async def audio_to_text(audio_bytes: bytes) -> str:
 async def text_to_audio_bytes(text: str) -> bytes:
     clean_text = text.strip() if text else ""
     if not clean_text: return b""
+
+    # --- Làm sạch văn bản cho loa dễ đọc ---
+    clean_text = clean_text.replace("°C", " độ C").replace("°", " độ")
+
     try:
         communicate = edge_tts.Communicate(clean_text, "vi-VN-HoaiMyNeural")
         audio_data = bytearray()
@@ -380,7 +382,8 @@ async def robot_endpoint(websocket: WebSocket, user_id: str):
                                 calc_result = json.loads(calc_result)
                             except:
                                 pass
-                            logger.info(f"✅ [MCP] Nhận kết quả thành công từ {server_name}: {str(calc_result)[:100]}...")
+                            logger.info(
+                                f"✅ [MCP] Nhận kết quả thành công từ {server_name}: {str(calc_result)[:100]}...")
 
                         except Exception as e:
                             # Bung Full Traceback nếu Python Code của Tool bị chết
@@ -394,14 +397,30 @@ async def robot_endpoint(websocket: WebSocket, user_id: str):
                     else:
                         logger.warning(f"⚠️ [MCP] Yêu cầu tool chưa được đăng ký: {tool_call.name}")
 
+            # -----------------------------------------------------
+            # 1. KIỂM TRA VÀ XỬ LÝ DỮ LIỆU RỖNG TỪ AI (Tránh lỗi DB)
+            # -----------------------------------------------------
+            if ai_text_response is None:
+                ai_text_response = ""
+            else:
+                ai_text_response = str(ai_text_response).strip()
+
+            # Nếu AI bị chặn bởi Safety Filter hoặc lỗi trả về chuỗi rỗng
+            if not ai_text_response:
+                ai_text_response = "Xin lỗi con, chú Robot đang không biết trả lời câu này thế nào. Con hỏi chú chuyện khác vui hơn nhé!"
+
+            # -----------------------------------------------------
+            # 2. SAU KHI ĐÃ ĐẢM BẢO CÓ TEXT CHUẨN MỚI LƯU VÀO DB
+            # -----------------------------------------------------
             logger.info(f"🤖 [LLM] Trả lời: {ai_text_response}")
             await save_chat_history(session_id, "robot", ai_text_response)
 
-            if not ai_text_response or not ai_text_response.strip():
-                ai_text_response = "Xin lỗi con, chú đang suy nghĩ một chút nhé."
-
+            # -----------------------------------------------------
+            # 3. GỬI PHẢN HỒI XUỐNG ROBOT (Đã nằm đúng lề trong while)
+            # -----------------------------------------------------
             await websocket.send_text(
-                json.dumps({"type": "text_response", "message": ai_text_response}, ensure_ascii=False))
+                json.dumps({"type": "text_response", "message": ai_text_response}, ensure_ascii=False)
+            )
 
             response_audio_bytes = await text_to_audio_bytes(ai_text_response)
             if response_audio_bytes:
