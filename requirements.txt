@@ -17,3 +17,5 @@ django-googlesearch
 requests
 beautifulsoup4
 ddgs
+
+websockets>=12.0

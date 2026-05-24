@@ -21,8 +21,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy toàn bộ mã nguồn của dự án (main.py, mcp_config.json, các mcp_servers...)
 COPY . .
 
-# Mở cổng 8000 để giao tiếp WebSocket
-EXPOSE 8000
-
-# Chạy Uvicorn Server
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Mở cổng 7860 cho Hugging Face
+EXPOSE 7860
+# Chạy Uvicorn Server trên cổng 7860
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7860"]
