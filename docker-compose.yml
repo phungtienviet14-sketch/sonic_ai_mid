@@ -3,6 +3,7 @@ version: '3.8'
 services:
   db:
     image: postgres:15
+    container_name: robot_postgres_db
     environment:
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-chaidim}
@@ -11,32 +12,25 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
 
   main:
     build: .
+    container_name: robot_ai_backend
+    # Lệnh khởi chạy Server FastAPI
     command: uvicorn main:app --host 0.0.0.0 --port 8000
     environment:
+      # Truyền biến môi trường để main.py tự động nhận diện Database trong mạng Docker
       - DB_HOST=db
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-chaidim}
+      - DB_NAME=${DB_NAME:-postgres}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
     ports:
       - "8000:8000"
     depends_on:
       - db
-      - gateway
-
-  gateway:
-    build: .
-    command: uvicorn gateway:app --host 0.0.0.0 --port 8001
-    ports:
-      - "8001:8001"
-    depends_on:
-      - math_server
-
-  math_server:
-    build: .
-    command: uvicorn mcp_math_server:app --host 0.0.0.0 --port 8002
-    ports:
-      - "8002:8002"
+    restart: unless-stopped
 
 volumes:
   pgdata:
