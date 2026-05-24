@@ -1,14 +1,35 @@
 import json
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from google.genai import types
 
 from app.core.config import logger
 from app.core.mcp_manager import mcp_tools_registry, mcp_sessions
 import app.db.crud as crud
 from app.services.audio import audio_to_text, text_to_audio_bytes
-from app.services.llm import gemini_client, preference_tool, json_schema_to_gemini, safe_send_message
+from app.services.llm import LLMProviderFactory
 
 router = APIRouter()
+
+# Khai báo cấu trúc định nghĩa công cụ Preference Tool (Ghi nhớ sở thích)
+# Định dạng bằng cấu trúc JSON Schema chuẩn tương thích với mọi LLM Provider
+PREFERENCE_TOOL_RAW = {
+    "name": "update_preferences",
+    "description": "Sử dụng công cụ này KHI VÀ CHỈ KHI trẻ em chủ động kể về sở thích, đồ vật yêu thích, ước mơ, hoặc những thứ trẻ không thích. Trích xuất thông tin đó để hệ thống ghi nhớ.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "category": {
+                "type": "string",
+                "description": "Phân loại sở thích (snake_case). Ví dụ: 'favorite_food', 'favorite_animal'"
+            },
+            "value": {
+                "type": "string",
+                "description": "Giá trị cụ thể mà trẻ nhắc đến. Ví dụ: 'xúc xích'"
+            }
+        },
+        "required": ["category", "value"]
+    }
+}
+
 
 @router.websocket("/ws/robot/{user_id}")
 async def robot_endpoint(websocket: WebSocket, user_id: str):
@@ -17,25 +38,20 @@ async def robot_endpoint(websocket: WebSocket, user_id: str):
     session_id = await crud.create_chat_session(user_id)
     user_profile = await crud.get_user_profile(user_id)
 
-    # Nạp Tools cho Gemini
-    all_gemini_tools = [preference_tool]
-    dynamic_functions = []
-
+    # 1. Tạo danh sách Tools thống nhất dạng JSON Schema để chuyển qua LLM Provider
+    all_tools = [PREFERENCE_TOOL_RAW]
     for item in mcp_tools_registry:
         t = item["tool"]
-        dynamic_functions.append(types.FunctionDeclaration(
-            name=t.name, 
-            description=t.description,
-            parameters=json_schema_to_gemini(t.inputSchema)
-        ))
+        all_tools.append({
+            "name": t.name,
+            "description": t.description,
+            "parameters": t.inputSchema
+        })
 
-    if dynamic_functions:
-        all_gemini_tools.append(types.Tool(function_declarations=dynamic_functions))
-
-    # Cấu hình System Instruction (Bao gồm đề xuất lồng ghép weak_points)
+    # 2. Cấu hình System Instruction (Bao gồm đề xuất lồng ghép weak_points)
     base_prompt = "Bạn là chú Robot thông minh, vui vẻ và thân thiện đang nói chuyện với trẻ em. Hãy trả lời ngắn gọn, xưng là 'Chú Robot'. " \
-              "Nếu trẻ hỏi một thông tin mà bạn không biết hoặc công cụ không thể tìm ra, tuyệt đối không được nói dối hoặc bịaa chuyện. " \
-              "Hãy xin lỗi khéo léo, thừa nhận mình chưa biết và lái bé sang một chủ đề khác vui hơn."
+                  "Nếu trẻ hỏi một thông tin mà bạn không biết hoặc công cụ không thể tìm ra, tuyệt đối không được nói dối hoặc bịa chuyện. " \
+                  "Hãy xin lỗi khéo léo, thừa nhận mình chưa biết và lái bé sang một chủ đề khác vui hơn."
     
     if user_profile:
         name = user_profile.get("full_name", "bé")
@@ -55,24 +71,22 @@ async def robot_endpoint(websocket: WebSocket, user_id: str):
         logger.info(f"👤 [USER] Khách ẩn danh mới kết nối.")
         system_instruction = base_prompt + " Bé mới kết nối nên bạn chưa có nhiều thông tin về bé. Hãy hỏi thăm để làm quen nhé!"
 
-    # Đề xuất cải tiến 5: Duy trì ngữ cảnh (Tải lịch sử chat gần đây)
+    # 3. Nạp lịch sử chat gần đây
     recent_history = await crud.get_recent_chat_history(user_id, limit=6)
-    history_array = []
+    history_list = []
     if recent_history:
         logger.info(f"📜 [CTX] Nạp {len(recent_history)} tin nhắn cũ vào ngữ cảnh.")
         for msg in recent_history:
+            # map "sender" (user/robot) sang format "role" (user/model)
             role = "user" if msg["sender"] == "user" else "model"
-            content = msg["content"]
-            history_array.append(types.Content(role=role, parts=[types.Part.from_text(text=content)]))
+            history_list.append({"role": role, "content": msg["content"]})
 
-    chat = gemini_client.aio.chats.create(
-        model="gemini-2.5-flash",
-        config=types.GenerateContentConfig(
-            temperature=0.7, 
-            system_instruction=system_instruction,
-            tools=all_gemini_tools
-        ),
-        history=history_array if history_array else None
+    # 4. Khởi tạo LLM Provider thông qua Factory (Đa dạng hóa mô hình linh hoạt)
+    provider = LLMProviderFactory.get_provider()
+    chat = provider.create_chat_session(
+        system_instruction=system_instruction,
+        history=history_list,
+        tools=all_tools
     )
 
     try:
@@ -95,8 +109,9 @@ async def robot_endpoint(websocket: WebSocket, user_id: str):
 
             await crud.save_chat_history(session_id, "user", payload)
 
+            # 5. Gọi LLM gửi tin nhắn
             try:
-                response = await safe_send_message(chat, payload, websocket)
+                response = await chat.send_user_message(payload)
             except Exception:
                 await websocket.send_text(
                     json.dumps({"type": "text_response", "message": "Hệ thống AI đang quá tải, con hỏi lại sau nhé!"},
@@ -105,22 +120,30 @@ async def robot_endpoint(websocket: WebSocket, user_id: str):
 
             ai_text_response = response.text
 
-            # --- XỬ LÝ ĐIỀU PHỐI TOOL CALLING ---
+            # --- 6. XỬ LÝ ĐIỀU PHỐI TOOL CALLING (MCP & DB) ---
             if response.function_calls:
                 for tool_call in response.function_calls:
                     logger.info(f"⚙️ [LLM] Yêu cầu gọi công cụ: {tool_call.name}")
-                    args_dict = dict(tool_call.args) if tool_call.args else {}
+                    args_dict = tool_call.args
                     logger.debug(f"   ├─ Tham số: {args_dict}")
 
+                    # Thực thi công cụ ghi nhớ sở thích nội bộ
                     if tool_call.name == "update_preferences":
-                        db_status = await crud.update_user_preferences(user_id, args_dict.get("category"),
-                                                                  args_dict.get("value"))
-                        tool_response_part = types.Part.from_function_response(name="update_preferences",
-                                                                               response={"status": db_status})
-                        final_response = await safe_send_message(chat, tool_response_part, websocket)
+                        db_status = await crud.update_user_preferences(
+                            user_id, 
+                            args_dict.get("category"),
+                            args_dict.get("value")
+                        )
+                        # Gửi phản hồi thực thi tool lại cho LLM
+                        final_response = await chat.send_tool_response(
+                            tool_name="update_preferences",
+                            tool_call_id=tool_call.call_id,
+                            response_data={"status": db_status}
+                        )
                         ai_text_response = final_response.text
                         continue
 
+                    # Thực thi công cụ MCP từ bên ngoài
                     server_name = next(
                         (item["server"] for item in mcp_tools_registry if item["tool"].name == tool_call.name), None)
 
@@ -142,14 +165,17 @@ async def robot_endpoint(websocket: WebSocket, user_id: str):
                             logger.exception(f"❌ [MCP] Đã xảy ra lỗi khi thực thi Tool '{tool_call.name}':")
                             calc_result = f"Lỗi: {e}"
 
-                        tool_response_part = types.Part.from_function_response(name=tool_call.name,
-                                                                               response={"result": calc_result})
-                        final_response = await safe_send_message(chat, tool_response_part, websocket)
+                        # Gửi phản hồi thực thi tool lại cho LLM
+                        final_response = await chat.send_tool_response(
+                            tool_name=tool_call.name,
+                            tool_call_id=tool_call.call_id,
+                            response_data={"result": calc_result}
+                        )
                         ai_text_response = final_response.text
                     else:
                         logger.warning(f"⚠️ [MCP] Yêu cầu tool chưa được đăng ký: {tool_call.name}")
 
-            # 1. KIỂM TRA VÀ XỬ LÝ DỮ LIỆU RỖNG TỪ AI
+            # 7. KIỂM TRA VÀ XỬ LÝ DỮ LIỆU RỖNG TỪ AI
             if ai_text_response is None:
                 ai_text_response = ""
             else:
@@ -158,11 +184,11 @@ async def robot_endpoint(websocket: WebSocket, user_id: str):
             if not ai_text_response:
                 ai_text_response = "Xin lỗi con, chú Robot đang không biết trả lời câu này thế nào. Con hỏi chú chuyện khác vui hơn nhé!"
 
-            # 2. LƯU VÀO DB
+            # 8. LƯU LỊCH SỬ CHAT ROBOT VÀO DB
             logger.info(f"🤖 [LLM] Trả lời: {ai_text_response}")
             await crud.save_chat_history(session_id, "robot", ai_text_response)
 
-            # 3. GỬI PHẢN HỒI XUỐNG ROBOT
+            # 9. GỬI PHẢN HỒI XUỐNG ROBOT QUA WS
             await websocket.send_text(
                 json.dumps({"type": "text_response", "message": ai_text_response}, ensure_ascii=False)
             )
