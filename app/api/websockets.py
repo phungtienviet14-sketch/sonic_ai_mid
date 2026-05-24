@@ -55,23 +55,25 @@ async def robot_endpoint(websocket: WebSocket, user_id: str):
         logger.info(f"👤 [USER] Khách ẩn danh mới kết nối.")
         system_instruction = base_prompt + " Bé mới kết nối nên bạn chưa có nhiều thông tin về bé. Hãy hỏi thăm để làm quen nhé!"
 
+    # Đề xuất cải tiến 5: Duy trì ngữ cảnh (Tải lịch sử chat gần đây)
+    recent_history = await crud.get_recent_chat_history(user_id, limit=6)
+    history_array = []
+    if recent_history:
+        logger.info(f"📜 [CTX] Nạp {len(recent_history)} tin nhắn cũ vào ngữ cảnh.")
+        for msg in recent_history:
+            role = "user" if msg["sender"] == "user" else "model"
+            content = msg["content"]
+            history_array.append(types.Content(role=role, parts=[types.Part.from_text(text=content)]))
+
     chat = gemini_client.aio.chats.create(
         model="gemini-2.5-flash",
         config=types.GenerateContentConfig(
             temperature=0.7, 
             system_instruction=system_instruction,
             tools=all_gemini_tools
-        )
+        ),
+        history=history_array if history_array else None
     )
-
-    # Đề xuất cải tiến 5: Duy trì ngữ cảnh (Tải lịch sử chat gần đây)
-    recent_history = await crud.get_recent_chat_history(user_id, limit=6)
-    if recent_history:
-        logger.info(f"📜 [CTX] Nạp {len(recent_history)} tin nhắn cũ vào ngữ cảnh.")
-        for msg in recent_history:
-            role = "user" if msg["sender"] == "user" else "model"
-            content = msg["content"]
-            chat._history.append(types.Content(role=role, parts=[types.Part.from_text(text=content)]))
 
     try:
         while True:
