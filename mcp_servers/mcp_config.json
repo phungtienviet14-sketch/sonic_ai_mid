@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "math-server": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["mcp_servers/mcp_math_server.py"]
+    },
+    "search-server": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["mcp_servers/mcp_search_server.py"]
+    },
+    "weather-server": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["mcp_servers/mcp_weather_server.py"]
+    }
+  }
+}

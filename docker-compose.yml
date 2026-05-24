@@ -12,13 +12,14 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/init.sql
     restart: unless-stopped
 
   main:
     build: .
     container_name: robot_ai_backend
     # Lệnh khởi chạy Server FastAPI
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     environment:
       # Truyền biến môi trường để main.py tự động nhận diện Database trong mạng Docker
       - DB_HOST=db
