@@ -1,10 +1,10 @@
 # File: mcp_search_server.py
 import sys
+import os
 import logging
 import requests
 from bs4 import BeautifulSoup
 from fastmcp import FastMCP
-from ddgs import DDGS
 
 # Cấu hình hệ thống Logging đồng bộ với main.py
 logging.basicConfig(
@@ -20,6 +20,9 @@ if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
 
 mcp = FastMCP("SearchServer")
+
+# Đọc cấu hình SEARXNG_URL từ biến môi trường, mặc định là localhost nếu chạy local
+SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8080").rstrip('/')
 
 
 def scrape_webpage(url: str, max_chars: int = 2500) -> str:
@@ -53,26 +56,36 @@ def google_search(query: str) -> dict:
     """
     Sử dụng công cụ này để tìm kiếm thông tin sự kiện thực tế, kiến thức trên internet.
     """
-    logger.info(f"🔍 [MCP Search] Đang tìm kiếm qua mạng: {query}")
+    logger.info(f"🔍 [MCP Search] Đang truy vấn qua SearXNG ({SEARXNG_URL}): {query}")
 
     try:
         results = []
-        # Gọi API của DuckDuckGo
-        with DDGS() as ddgs:
-            # Lấy tối đa 3 kết quả để phòng trường hợp top 1 là widget/quảng cáo
-            responses = ddgs.text(query, max_results=3)
-            if responses:
-                results = list(responses)
+        # Gọi JSON API của SearXNG tự host
+        # Chỉ định engines=google,bing để tối ưu hóa nguồn kết quả chất lượng
+        search_endpoint = f"{SEARXNG_URL}/search"
+        params = {
+            "q": query,
+            "format": "json",
+            "engines": "google,bing,duckduckgo"
+        }
+        
+        response = requests.get(search_endpoint, params=params, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
+        results = data.get("results", [])
 
         if not results:
-            return {"success": False, "error": "Không tìm thấy thông tin trên mạng."}
+            return {"success": False, "error": f"Không tìm thấy thông tin trên SearXNG ({SEARXNG_URL})."}
 
+        # Lấy tối đa 3 kết quả để phân tích nội dung chi tiết
+        top_results = results[:3]
         full_text = ""
         used_result = None
 
         # Lặp qua các kết quả để tìm một đường link hợp lệ có thể cào được nội dung
-        for res in results:
-            url = res.get("href")
+        for res in top_results:
+            url = res.get("url") or res.get("href")
             if not url:
                 continue
 
@@ -86,19 +99,19 @@ def google_search(query: str) -> dict:
                 logger.warning(f"⚠️ [MCP Search] Cào thất bại, thử link tiếp theo...")
 
         # Nếu cả 3 link đều cào thất bại (do bị chặn hoặc không có thẻ <p>)
-        # Bắt buộc phải dùng tạm đoạn mô tả ngắn (body) của kết quả đầu tiên.
+        # Bắt buộc phải dùng tạm đoạn mô tả ngắn (content hoặc body) của kết quả đầu tiên.
         if not full_text:
             used_result = results[0]
-            full_text = used_result.get("body", "Không có nội dung mô tả chi tiết.")
+            full_text = used_result.get("content") or used_result.get("body") or "Không có nội dung mô tả chi tiết."
             logger.warning("⚠️ [MCP Search] Không cào được link nào, sử dụng tạm đoạn mô tả ngắn.")
 
         result_data = {
             "title": used_result.get("title", "Không có tiêu đề"),
-            "source_url": used_result.get("href", ""),
+            "source_url": used_result.get("url") or used_result.get("href", ""),
             "content": full_text
         }
 
-        logger.info(f"✅ [MCP Search] Đã lấy thành công {len(full_text)} ký tự.")
+        logger.info(f"✅ [MCP Search] Đã lấy thành công {len(full_text)} ký tự từ {result_data['source_url']}.")
         return {"success": True, "data": result_data}
 
     except Exception as e:

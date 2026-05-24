@@ -1,0 +1,32 @@
+# Cấu hình SearXNG cho Sonic AI Backend
+
+# Sử dụng toàn bộ cấu hình mặc định để tự động nạp các công cụ tìm kiếm phổ biến (Google, Bing, Yahoo, Wikipedia...)
+use_default_settings: true
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  # Khóa bí mật dùng để mã hóa session nội bộ của SearXNG
+  secret_key: "sonic_ai_secret_key_change_me_123456789"
+
+search:
+  # CỰC KỲ QUAN TRỌNG: Cho phép xuất kết quả dưới dạng JSON để MCP Search Server có thể kết nối
+  formats:
+    - html
+    - json
+
+# Cấu hình tối ưu hóa các công cụ tìm kiếm
+engines:
+  - name: google
+    engine: google
+    shortcut: go
+    timeout: 3.0
+    enable_http: true
+  - name: bing
+    engine: bing
+    shortcut: bi
+    timeout: 3.0
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: dd
+    timeout: 3.0
