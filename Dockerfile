@@ -21,7 +21,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy toàn bộ mã nguồn của dự án (main.py, mcp_config.json, các mcp_servers...)
 COPY . .
 
-# Mở cổng 7860 cho Hugging Face
+# Mở cổng 7860 để giao tiếp trên Hugging Face Spaces
 EXPOSE 7860
-# Chạy Uvicorn Server trên cổng 7860
+
+# Chạy Uvicorn Server trên port 7860
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7860"]
